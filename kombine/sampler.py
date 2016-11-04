@@ -29,6 +29,9 @@ class _GetLnProbWrapper(object):
         self.kde = kde
         self.args = args
 
+    def update_kde(self, kde):
+        self.kde = kde
+
     def lnprobs(self, p):
         """
         Evaluate the log probability density of the stored target distribution fuction
@@ -52,6 +55,17 @@ class _GetLnProbWrapper(object):
             return lnpost, kde
 
     __call__ = lnprobs
+
+_lnprob_wrapper = None
+def _set_global_lnprob_wrapper(wrapper_instance):
+    global _lnprob_wrapper
+    _lnprob_wrapper = wrapper_instance
+
+def _get_lnprob_from_wrapper(p):
+    return _lnprob_wrapper.lnprobs(p)
+
+def _update_wrapper_kde(kde):
+    _lnprob_wrapper.update_kde(kde)
 
 class Sampler(object):
     """
@@ -81,13 +95,15 @@ class Sampler(object):
         The number of processes to use with :mod:`multiprocessing`.  If ``None``, all available
         cores are used.
 
-    :param pool: (optional)
-        A pre-constructed pool with a map method. If ``None`` a pool will be created using
+    :param pool_class: (optional)
+        Create pools for multi-processing from the given class. The class must
+        initialize with the number of processes to use. Instances of the class
+        must have a map method. If ``None`` a pool will be created using
         :mod:`multiprocessing`.
 
     """
     def __init__(self, nwalkers, ndim, lnpostfn, transd=False,
-                 processes=None, pool=None, args=[]):
+                 processes=None, pool_class=None, args=[]):
         self.nwalkers = nwalkers
         self.dim = ndim
         self._kde = None
@@ -102,18 +118,20 @@ class Sampler(object):
 
         self.processes = processes
 
-        if pool is not None:
-            self.pool = pool
-
+        self._pool = None
+        if pool_class is not None:
+            self._pool_class = pool_class
         elif self.processes == 1:
-            self.pool = SerialPool()
-
+            self._pool_class = SerialPool
         else:
             # create a multiprocessing pool
-            self.pool = Pool(self.processes)
+            self._pool_class = Pool
 
-        if not hasattr(self.pool, 'map'):
+        if not hasattr(self._pool_class, 'map'):
             raise AttributeError("Pool object must have a map() method.")
+
+        _set_global_lnprob_wrapper(_GetLnProbWrapper(self._get_lnpost, self._kde, *self._lnpost_args))
+        self._pool = self._pool_class(self.processes)
 
         self._transd = transd
         if self._transd:
@@ -351,14 +369,12 @@ class Sampler(object):
                 #   Operations with masked arrays can be slow.
                 p = np.array(p0, copy=True)
 
-        m = self.pool.map
-
         if kde_size:
             self._kde_size = kde_size
 
         # Build a proposal if one doesn't already exist
         if kde is not None:
-            self._kde = kde
+            self.set_kde(kde)
         elif self._kde is None:
             self.update_proposal(p, max_samples=self._kde_size, **kwargs)
             lnprop0 = self._kde(p)
@@ -368,7 +384,7 @@ class Sampler(object):
         blob = blob0
 
         if lnpost is None or lnprop is None:
-            results = list(m(_GetLnProbWrapper(self._get_lnpost, self._kde, *self._lnpost_args), p))
+            results = list(self._pool.map(_get_lnprob_from_wrapper, p))
             lnpost = np.array([r[0] for r in results]) if lnpost is None else lnpost
             lnprop = np.array([r[1] for r in results]) if lnprop is None else lnprop
 
@@ -407,9 +423,7 @@ class Sampler(object):
                 # Calculate the posterior probability and proposal density
                 # at the proposed locations
                 try:
-                    results = list(m(_GetLnProbWrapper(self._get_lnpost, self._kde,
-                                                       *self._lnpost_args), p_p))
-
+                    results = list(self._pool.map(_get_lnprob_from_wrapper, p_p))
                     lnpost_p = np.array([r[0] for r in results])
                     lnprop_p = np.array([r[1] for r in results])
                     try:
@@ -491,9 +505,7 @@ class Sampler(object):
 
         pts = self.draw(ndraws)
 
-        m = self.pool.map
-
-        results = list(m(_GetLnProbWrapper(self._get_lnpost, self._kde, *self._lnpost_args), pts))
+        results = list(self._pool.map(_get_lnprob_from_wrapper, pts))
         lnpost = np.array([r[0] for r in results])
         lnprop = np.array([r[1] for r in results])
 
@@ -573,11 +585,23 @@ class Sampler(object):
         self._updates.append(self.iterations)
 
         if self._transd:
-            self._kde = TransdimensionalKDE(p, pool=self.pool, kde=self._kde,
-                                            max_samples=self._kde_size, **kwargs)
+            self.set_kde(TransdimensionalKDE(p, pool=self._pool, kde=self._kde,
+                                            max_samples=self._kde_size, **kwargs))
         else:
-            self._kde = optimized_kde(p, pool=self.pool, kde=self._kde,
-                                      max_samples=self._kde_size, **kwargs)
+            self.set_kde(optimized_kde(p, pool=self._pool, kde=self._kde,
+                                      max_samples=self._kde_size, **kwargs))
+
+
+    def set_kde(self, kde):
+        """Sets self's kde and re-creates the pool to use it."""
+        self._kde = kde
+        self._pool.map(_update_wrapper_kde, [kde]*self.processes)
+
+    
+    @property
+    def pool(self):
+        """Returns the pool instance."""
+        return self._pool
 
     @property
     def failed_p(self):
@@ -787,8 +811,6 @@ class Sampler(object):
               positions `p`.
         """
 
-        m = self.pool.map
-
         if p0 is None:
             if self._last_run_mcmc_result is None:
                 try:
@@ -808,8 +830,7 @@ class Sampler(object):
 
         if self._kde is not None:
             if self._last_run_mcmc_result is None and (lnpost0 is None or lnprop0 is None):
-                results = list(m(_GetLnProbWrapper(self._get_lnpost, self._kde, *self._lnpost_args), p0))
-
+                results = list(self._pool.map(_get_lnprob_from_wrapper, p0))
                 if lnpost0 is None:
                     lnpost0 = np.array([r[0] for r in results])
                 if lnprop0 is None:
