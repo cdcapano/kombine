@@ -58,6 +58,13 @@ class _GetLnProbWrapper(object):
 
 _lnprob_wrapper = None
 def _set_global_lnprob_wrapper(wrapper_instance):
+    """Sets `_lnprob_wrapper` to a global variable equal to the provided
+    instance of `_GetLnProbWrapper`. Making the wrapper a global variable
+    allows chilren processes to access their own copy of the wrapper without
+    needing to push out the same data on every call. For this to work it must
+    be done *before* a multiprocessing pool is initialized. See
+    http://stackoverflow.com/a/10118250 for details.
+    """
     global _lnprob_wrapper
     _lnprob_wrapper = wrapper_instance
 
